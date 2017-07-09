@@ -156,7 +156,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	rf.alreadyVoted = true
 	rf.votedFor = args.CandidateId
-	fmt.Printf("[%d] args.Term:%d rf.currentTerm:%d rf.votedFor:%t\n", rf.me, args.Term, rf.currentTerm, rf.votedFor)
+	fmt.Printf("[%d] args.Term:%d rf.currentTerm:%d rf.votedFor:%d\n", rf.me, args.Term, rf.currentTerm, rf.votedFor)
 	rf.currentTerm = args.Term
 	return
 }
@@ -197,6 +197,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 type AppendEntriesRequest struct {
 	Term int
+	LeaderId int
 }
 
 type AppendEntriesReply struct {
@@ -208,12 +209,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term >= rf.currentTerm {
-		fmt.Printf("[%d] AppendEntries-received heartbeat\n", rf.me)
+		// fmt.Printf("[%d] AppendEntries-received heartbeat\n", rf.me)
 		rf.heartbeatChan<-true
 		rf.currentTerm = args.Term
+		rf.leaderId = args.LeaderId
 		reply.Success = true
 	} else {
 		// follower has higher term, will step to candidate
+		rf.leaderId = -1
 		rf.quitFollowerChan<-true
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -262,11 +265,11 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft) switchToFollower() {
 	fmt.Printf("[%d] switchToFollower\n", rf.me)
+	rf.alreadyVoted = false
 	for {
-		randSleep := randInt(500, 1000)
+		randSleep := randInt(250, 500)
 		select {
 		case <-rf.heartbeatChan:
-			fmt.Printf("[%d] <-rf.heartbeatChan\n", rf.me)
 			break
 		case <-time.After(time.Duration(randSleep) * time.Millisecond):
 			go rf.switchToCandidate()
@@ -303,7 +306,6 @@ func (rf *Raft) switchToCandidate() {
 
 	// become leader
 	fmt.Printf("[%d] receivedVotes:%d\n", rf.me, rf.receivedVotes)
-	fmt.Printf("[%d] requiredVotes:%d\n", rf.me, len(rf.peers)/2)
 	if rf.receivedVotes >= len(rf.peers)/2 {
 		go rf.switchToLeader()
 	} else {
@@ -312,6 +314,8 @@ func (rf *Raft) switchToCandidate() {
 }
 
 func (rf *Raft) switchToLeader() {
+	rf.leaderId = rf.me
+	rf.alreadyVoted = false
 	fmt.Printf("[%d] switchToLeader\n", rf.me)
 	for {
 		for i := 0; i < len(rf.peers); i++ {
@@ -320,6 +324,7 @@ func (rf *Raft) switchToLeader() {
 			}
 			request := &AppendEntriesRequest{}
 			request.Term = rf.currentTerm
+			request.LeaderId = rf.me
 			go rf.sendHeartbeat(i, request)
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -383,6 +388,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.leaderId = -1
+	rf.heartbeatChan = make(chan bool)
+	rf.quitFollowerChan = make(chan bool)
 
 	// Your initialization code here (2A, 2B, 2C).
 	go rf.switchToFollower()
