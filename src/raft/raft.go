@@ -57,7 +57,16 @@ type Raft struct {
  receivedVotes int
  heartbeatChan chan bool
  quitFollowerChan chan bool
+ state State
 }
+
+type State int
+
+const (
+        LEADER State = iota
+        FOLLOWER
+        CANDIDATE
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -67,7 +76,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	term = rf.currentTerm
-	isleader = rf.me == rf.leaderId
+	isleader = rf.state == LEADER
 
 	return term, isleader
 }
@@ -264,71 +273,15 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) switchToFollower() {
-	fmt.Printf("[%d] switchToFollower\n", rf.me)
-	rf.alreadyVoted = false
-	for {
-		randSleep := randInt(250, 500)
-		select {
-		case <-rf.heartbeatChan:
-			break
-		case <-time.After(time.Duration(randSleep) * time.Millisecond):
-			go rf.switchToCandidate()
-			return
-		case <-rf.quitFollowerChan:
-			go rf.switchToCandidate()
-			return
-		}
-	}
+
 }
 
 func (rf *Raft) switchToCandidate() {
-	fmt.Printf("[%d] switchToCandidate\n", rf.me)
-	rf.currentTerm++
-	rf.votedFor = rf.me
-	rf.alreadyVoted = true
-	rf.receivedVotes = 0
 
-	request := &RequestVoteArgs{}
-	request.Term = rf.currentTerm
-	request.CandidateId = rf.me
-
-	var wg sync.WaitGroup
-	wg.Add(len(rf.peers) - 1)
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		go rf.collectVotes(i, request, &wg)
-	}
-
-	wg.Wait()
-
-	// become leader
-	fmt.Printf("[%d] receivedVotes:%d\n", rf.me, rf.receivedVotes)
-	if rf.receivedVotes >= len(rf.peers)/2 {
-		go rf.switchToLeader()
-	} else {
-		go rf.switchToFollower()
-	}
 }
 
 func (rf *Raft) switchToLeader() {
-	rf.leaderId = rf.me
-	rf.alreadyVoted = false
-	fmt.Printf("[%d] switchToLeader\n", rf.me)
-	for {
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
-			}
-			request := &AppendEntriesRequest{}
-			request.Term = rf.currentTerm
-			request.LeaderId = rf.me
-			go rf.sendHeartbeat(i, request)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+
 }
 
 func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesRequest) {
@@ -382,6 +335,78 @@ func randInt(min int, max int) int {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+
+func(rf *Raft) serverRunning() {
+	for {
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
+		switch state {
+		case LEADER:
+			rf.leaderId = rf.me
+			rf.alreadyVoted = false
+			fmt.Printf("[%d] switchToLeader\n", rf.me)
+			for {
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					request := &AppendEntriesRequest{}
+					request.Term = rf.currentTerm
+					request.LeaderId = rf.me
+					go rf.sendHeartbeat(i, request)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		case FOLLOWER:
+			fmt.Printf("[%d] switchToFollower\n", rf.me)
+			rf.alreadyVoted = false
+			randSleep := randInt(250, 500)
+			select {
+			case <-rf.heartbeatChan:
+			case <-time.After(time.Duration(randSleep) * time.Millisecond):
+				rf.changeStateTo(CANDIDATE)
+			case <-rf.quitFollowerChan:
+				rf.changeStateTo(CANDIDATE)
+			}
+		case CANDIDATE:
+
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.alreadyVoted = true
+			rf.receivedVotes = 0
+
+			request := &RequestVoteArgs{}
+			request.Term = rf.currentTerm
+			request.CandidateId = rf.me
+
+			var wg sync.WaitGroup
+			wg.Add(len(rf.peers) - 1)
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				go rf.collectVotes(i, request, &wg)
+			}
+
+			wg.Wait()
+			// become leader
+			fmt.Printf("[%d] receivedVotes:%d\n", rf.me, rf.receivedVotes)
+			if rf.receivedVotes >= len(rf.peers)/2 {
+				rf.changeStateTo(LEADER)
+			} else {
+				rf.changeStateTo(FOLLOWER)
+			}
+		}
+	}
+}
+
+func(rf *Raft) changeStateTo(toState State) {
+	rf.mu.Lock()
+	rf.state = toState
+	rf.mu.Unlock()
+}
+
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -391,9 +416,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.leaderId = -1
 	rf.heartbeatChan = make(chan bool)
 	rf.quitFollowerChan = make(chan bool)
-
+	rf.state = FOLLOWER
 	// Your initialization code here (2A, 2B, 2C).
-	go rf.switchToFollower()
+	go rf.serverRunning()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
