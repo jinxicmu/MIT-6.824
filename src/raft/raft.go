@@ -239,7 +239,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	} else {
 		// follower has higher term, will step to candidate
 		rf.leaderId = -1
-		rf.switchToCandidateChan<-true
+		if rf.getServerState == FOLLOWER {
+			rf.switchToCandidateChan<-true
+	  }
 		reply.Success = false
 		reply.Term = rf.currentTerm
 	}
@@ -376,28 +378,30 @@ func(rf *Raft) serverRunning() {
 		case LEADER:
 			go rf.broadcastHeartbeats()
 			select {
+			case <-time.After(100 * time.Millisecond):
 			case <-rf.switchToFollowerChan:
 				rf.changeStateTo(FOLLOWER)
 			case <-rf.switchToCandidateChan:
 			case <-rf.switchToLeaderChan:
-			case <-time.After(100 * time.Millisecond):
 			}
 		case FOLLOWER:
 			select {
-			case <-rf.switchToFollowerChan:
 			case <-time.After(getRandomTimeOut(250, 500)):
 				rf.changeStateTo(CANDIDATE)
+			case <-rf.switchToFollowerChan:
 			case <-rf.switchToCandidateChan:
 				rf.changeStateTo(CANDIDATE)
+			case <-rf.switchToLeaderChan:
 			}
 		case CANDIDATE:
 			go rf.startNewElectionRound()
 			select {
+			case <-time.After(getRandomTimeOut(250, 500)):
 			case <-rf.switchToFollowerChan:
 				rf.changeStateTo(FOLLOWER)
-			case <-time.After(getRandomTimeOut(250, 500)):
 			case <-rf.switchToLeaderChan:
 				rf.changeStateTo(LEADER)
+			case <-rf.switchToCandidateChan:
 			}
 		}
 	}
