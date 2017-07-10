@@ -55,8 +55,9 @@ type Raft struct {
  alreadyVoted bool
  heartbeatReceived bool
  receivedVotes int
- heartbeatChan chan bool
- quitFollowerChan chan bool
+ switchToFollowerChan chan bool
+ switchToCandidateChan chan bool
+ switchToLeaderChan chan bool
  state State
 }
 
@@ -199,9 +200,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	reply := &RequestVoteReply{}
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		fmt.Printf("[%d] Hear back after sendRequestVote - RequestVoteReply.VoteGranted:%t\n", rf.me, reply.VoteGranted)
+		if reply.VoteGranted{
+			rf.receivedVotes++
+		} else {
+			rf.currentTerm = findMax(rf.currentTerm, reply.Term)
+		}
+	}
 }
 
 type AppendEntriesRequest struct {
@@ -219,23 +232,77 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	defer rf.mu.Unlock()
 	if args.Term >= rf.currentTerm {
 		// fmt.Printf("[%d] AppendEntries-received heartbeat\n", rf.me)
-		rf.heartbeatChan<-true
+		rf.switchToFollowerChan<-true
 		rf.currentTerm = args.Term
 		rf.leaderId = args.LeaderId
 		reply.Success = true
 	} else {
 		// follower has higher term, will step to candidate
 		rf.leaderId = -1
-		rf.quitFollowerChan<-true
+		rf.switchToCandidateChan<-true
 		reply.Success = false
 		reply.Term = rf.currentTerm
 	}
 	return
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest) {
+	reply := &AppendEntriesReply{}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+	if ok && !reply.Success {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm = findMax(rf.currentTerm, reply.Term)
+	}
+}
+
+func (rf *Raft) broadcastHeartbeats() {
+	rf.mu.Lock()
+	request := &AppendEntriesRequest{}
+	request.Term = rf.currentTerm
+	request.LeaderId = rf.me
+	rf.mu.Unlock()
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.sendAppendEntries(i, request)
+	}
+}
+
+func (rf *Raft) startNewElectionRound() {
+	request := &RequestVoteArgs{}
+
+	rf.mu.Lock()
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.alreadyVoted = true
+	rf.receivedVotes = 0
+	request.Term = rf.currentTerm
+	request.CandidateId = rf.me
+	rf.mu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(len(rf.peers) - 1)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.sendRequestVote(i, request, &wg)
+	}
+	wg.Wait()
+
+	// while waiting, a candidate may turn into a follower already
+	if rf.getServerState() == FOLLOWER {
+		return
+	}
+
+	// become leader
+	fmt.Printf("[%d] receivedVotes:%d\n", rf.me, rf.receivedVotes)
+	if rf.receivedVotes >= len(rf.peers)/2 {
+		rf.switchToLeaderChan<-true
+	}
 }
 
 //
@@ -272,46 +339,6 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
-func (rf *Raft) switchToFollower() {
-
-}
-
-func (rf *Raft) switchToCandidate() {
-
-}
-
-func (rf *Raft) switchToLeader() {
-
-}
-
-func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesRequest) {
-	reply := &AppendEntriesReply{}
-	ok := rf.sendAppendEntries(server, args, reply)
-	if ok && !reply.Success {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		rf.currentTerm = findMax(rf.currentTerm, reply.Term)
-	}
-}
-
-func (rf *Raft) collectVotes(server int, args *RequestVoteArgs, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	reply := &RequestVoteReply{}
-	ok := rf.sendRequestVote(server, args, reply)
-	fmt.Printf("[%d] collectVotes-RequestVoteReply.VoteGranted:%t\n", rf.me, reply.VoteGranted)
-
-	if ok {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if reply.VoteGranted{
-			rf.receivedVotes++
-		} else {
-			rf.currentTerm = findMax(rf.currentTerm, reply.Term)
-		}
-	}
-}
-
 func findMax(a int, b int) int {
 	if a > b {
 		return a
@@ -320,8 +347,14 @@ func findMax(a int, b int) int {
 	}
 }
 
-func randInt(min int, max int) int {
-    return min + rand.Intn(max-min)
+func getRandomTimeOut(min int, max int) time.Duration {
+	return time.Duration(min + rand.Intn(max-min)) * time.Millisecond
+}
+
+func(rf *Raft) getServerState() State{
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state
 }
 
 //
@@ -338,64 +371,33 @@ func randInt(min int, max int) int {
 
 func(rf *Raft) serverRunning() {
 	for {
-		rf.mu.Lock()
-		state := rf.state
-		rf.mu.Unlock()
+		state := rf.getServerState()
 		switch state {
 		case LEADER:
-			rf.leaderId = rf.me
-			rf.alreadyVoted = false
-			fmt.Printf("[%d] switchToLeader\n", rf.me)
-			for {
-				for i := 0; i < len(rf.peers); i++ {
-					if i == rf.me {
-						continue
-					}
-					request := &AppendEntriesRequest{}
-					request.Term = rf.currentTerm
-					request.LeaderId = rf.me
-					go rf.sendHeartbeat(i, request)
-				}
-				time.Sleep(100 * time.Millisecond)
+			go rf.broadcastHeartbeats()
+			select {
+			case <-rf.switchToFollowerChan:
+				rf.changeStateTo(FOLLOWER)
+			case <-rf.switchToCandidateChan:
+			case <-rf.switchToLeaderChan:
+			case <-time.After(100 * time.Millisecond):
 			}
 		case FOLLOWER:
-			fmt.Printf("[%d] switchToFollower\n", rf.me)
-			rf.alreadyVoted = false
-			randSleep := randInt(250, 500)
 			select {
-			case <-rf.heartbeatChan:
-			case <-time.After(time.Duration(randSleep) * time.Millisecond):
+			case <-rf.switchToFollowerChan:
+			case <-time.After(getRandomTimeOut(250, 500)):
 				rf.changeStateTo(CANDIDATE)
-			case <-rf.quitFollowerChan:
+			case <-rf.switchToCandidateChan:
 				rf.changeStateTo(CANDIDATE)
 			}
 		case CANDIDATE:
-
-			rf.currentTerm++
-			rf.votedFor = rf.me
-			rf.alreadyVoted = true
-			rf.receivedVotes = 0
-
-			request := &RequestVoteArgs{}
-			request.Term = rf.currentTerm
-			request.CandidateId = rf.me
-
-			var wg sync.WaitGroup
-			wg.Add(len(rf.peers) - 1)
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
-				}
-				go rf.collectVotes(i, request, &wg)
-			}
-
-			wg.Wait()
-			// become leader
-			fmt.Printf("[%d] receivedVotes:%d\n", rf.me, rf.receivedVotes)
-			if rf.receivedVotes >= len(rf.peers)/2 {
-				rf.changeStateTo(LEADER)
-			} else {
+			go rf.startNewElectionRound()
+			select {
+			case <-rf.switchToFollowerChan:
 				rf.changeStateTo(FOLLOWER)
+			case <-time.After(getRandomTimeOut(250, 500)):
+			case <-rf.switchToLeaderChan:
+				rf.changeStateTo(LEADER)
 			}
 		}
 	}
@@ -403,8 +405,19 @@ func(rf *Raft) serverRunning() {
 
 func(rf *Raft) changeStateTo(toState State) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.state = toState
-	rf.mu.Unlock()
+	rf.alreadyVoted = false
+	switch toState {
+	case LEADER:
+		rf.leaderId = rf.me
+		fmt.Printf("[%d] switchToLeader\n", rf.me)
+	case FOLLOWER:
+		fmt.Printf("[%d] switchToFollower\n", rf.me)
+	case CANDIDATE:
+		rf.leaderId = -1
+		fmt.Printf("[%d] switchToCandidate\n", rf.me)
+	}
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -414,8 +427,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.leaderId = -1
-	rf.heartbeatChan = make(chan bool)
-	rf.quitFollowerChan = make(chan bool)
+	rf.switchToFollowerChan = make(chan bool)
+	rf.switchToCandidateChan = make(chan bool)
+	rf.switchToLeaderChan = make(chan bool)
 	rf.state = FOLLOWER
 	// Your initialization code here (2A, 2B, 2C).
 	go rf.serverRunning()
